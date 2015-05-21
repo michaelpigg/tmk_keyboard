@@ -26,12 +26,64 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "print.h"
 #include "debug.h"
 
+#define MOUSE_SET_RESOLUTION   0xE8
+#define MOUSE_STATUS_REQUEST   0xE9
+#define MOUSE_SET_STREAM_MODE  0xEA
+#define MOUSE_SET_REMOTE_MODE  0xF0
+#define MOUSE_SET_SAMPLE_RATE  0xF3
+#define MOUSE_ENABLE     0xF4
+#define MOUSE_DISABLE    0xF5
+#define MOUSE_RESET      0xFF
+#define MOUSE_RESEND     0xFE
+#define MOUSE_ERROR      0xFC
+
+#define SYNAP_SET_MODE    0x14
+#define SYNAP_TUNNEL_CMD  0x28
+
+#define SYNAP_MODE_ABSOLUTE  0x80
+#define SYNAP_MODE_HIGH_RATE  0x40
+#define SYNAP_MODE_TRANSPARENT 0x20
+#define SYNAP_MODE_EXT_W 0x04
+#define SYNAP_MODE_W  0x01
 
 static report_mouse_t mouse_report = {};
-
-
 static void print_usb_data(void);
 
+uint8_t mouse_send(uint8_t data) {
+  uint8_t rcv = ps2_host_send(data);
+  if (rcv != PS2_ACK) xprintf("Send %02x failed! : %02x", data, rcv);
+  return rcv;
+}
+
+uint8_t synap_encode_byte(uint8_t data) {
+  uint8_t rcv;
+  mouse_send(MOUSE_SET_RESOLUTION);
+  mouse_send(data >> 6 & 0x03);
+  mouse_send(MOUSE_SET_RESOLUTION);
+  mouse_send(data >> 4 & 0x03);
+  mouse_send(MOUSE_SET_RESOLUTION);
+  mouse_send(data >> 2 & 0x03);
+  mouse_send(MOUSE_SET_RESOLUTION);
+  rcv = mouse_send(data & 0x03);
+  return rcv;
+}
+
+uint8_t synap_encoded_command(uint8_t data, uint8_t cmd) {
+    print("sending encoded command "); phex(cmd); print("with data "); phex(data); print("\n");
+    uint8_t rcv = mouse_send(MOUSE_DISABLE);
+    rcv = synap_encode_byte(data);
+    rcv = mouse_send(MOUSE_SET_SAMPLE_RATE);
+    rcv = mouse_send(cmd);
+    return rcv;
+}
+
+uint8_t synap_set_mode(uint8_t mode) {
+  return synap_encoded_command(mode, SYNAP_SET_MODE);
+}
+
+uint8_t synap_tunnel_cmd(uint8_t cmd) {
+  return synap_encoded_command(cmd, SYNAP_TUNNEL_CMD);
+}
 
 /* supports only 3 button mouse at this time */
 uint8_t ps2_mouse_init(void) {
@@ -41,25 +93,30 @@ uint8_t ps2_mouse_init(void) {
 
     _delay_ms(1000);    // wait for powering up
 
+    ps2_host_recv();
+
     // send Reset
     rcv = ps2_host_send(0xFF);
     print("ps2_mouse_init: send Reset: ");
-    phex(rcv); phex(ps2_error); print("\n");
+    phex(rcv); print("\n");
 
     // read completion code of BAT
     rcv = ps2_host_recv_response();
-    print("ps2_mouse_init: read BAT: ");
-    phex(rcv); phex(ps2_error); print("\n");
+    while (rcv != 0xAA && rcv != 0xFC) {
+    print("ps2_mouse_init: waiting for BAT response \n");
+        rcv = ps2_host_recv_response();
+   }
 
     // read Device ID
     rcv = ps2_host_recv_response();
-    print("ps2_mouse_init: read DevID: ");
-    phex(rcv); phex(ps2_error); print("\n");
+    print("ps2_mouse_init: read DevID: "); phex(rcv); print("\n");
+    //phex(rcv); phex(ps2_error); print("\n");
 
-    // send Set Remote mode
-    rcv = ps2_host_send(0xF0);
-    print("ps2_mouse_init: send 0xF0: ");
-    phex(rcv); phex(ps2_error); print("\n");
+    println("setting touchpad mode");
+    synap_set_mode(SYNAP_MODE_ABSOLUTE | SYNAP_MODE_W | SYNAP_MODE_EXT_W);
+
+    println("sending enable");
+    mouse_send(MOUSE_ENABLE);
 
     return 0;
 }
@@ -74,22 +131,50 @@ void ps2_mouse_task(void)
     static uint8_t scroll_state = SCROLL_NONE;
     static uint8_t buttons_prev = 0;
 
+    static uint8_t buffer[6];
+    static int buffer_cur = 0;
+
     /* receives packet from mouse */
     uint8_t rcv;
-    rcv = ps2_host_send(PS2_MOUSE_READ_DATA);
-    if (rcv == PS2_ACK) {
-        mouse_report.buttons = ps2_host_recv_response();
-        mouse_report.x = ps2_host_recv_response();
-        mouse_report.y = ps2_host_recv_response();
-    } else {
-        if (debug_mouse) print("ps2_mouse: fail to get mouse packet\n");
-        return;
+    rcv = ps2_host_recv();
+    if (ps2_error == PS2_ERR_NODATA) {
+      return;
     }
-        xprintf("%ud ", timer_read());
-        print("ps2_mouse raw: [");
-        phex(mouse_report.buttons); print("|");
-        print_hex8((uint8_t)mouse_report.x); print(" ");
-        print_hex8((uint8_t)mouse_report.y); print("]\n");
+
+    // discard bytes until we find one with an absolute mode pattern
+    if (buffer_cur == 0 && rcv != 0x84) {
+      return;
+    }
+
+    print("ps2_mouse: byte: "); phex(rcv); print("\n");
+
+    if (buffer_cur == 3) {
+/*      uint8_t w0 = (rcv & 0x4) >> 2;
+      // check if we're on track for an encapsulation packet
+      uint8_t w1 = (buffer[0] & 0x4) >> 1;
+      uint8_t w23 = (buffer[0] & 0x30) >> 2;*/
+      if (rcv != 0xC4) {
+        buffer_cur = 0;
+        println("not an encapsulation packet");
+        return;
+      } else {
+        println("looks like encapsulation packet");
+      }
+    }
+
+
+    buffer[buffer_cur++] = rcv;
+
+    if (buffer_cur < 6) {
+      phex(buffer_cur); println(" waiting for full packet");
+      return;
+    }
+
+    buffer_cur = 0;
+
+    mouse_report.buttons = buffer[1];
+    mouse_report.x = buffer[4];
+    mouse_report.y = buffer[5];
 
     /* if mouse moves or buttons state changes */
     if (mouse_report.x || mouse_report.y ||
